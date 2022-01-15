@@ -9,6 +9,7 @@ import tempfile
 import warnings
 import numpy as np
 from pathlib import Path
+from urllib.request import urlopen
 import argparse
 import torch
 from torch import nn, optim
@@ -109,7 +110,7 @@ class Predictor(cog.Predictor):
 
     @cog.input(
         "image",
-        type=Path,
+        type=str,
         default=None,
         help="Initial Image, optional. When the image is provided, the prompts will be used to create some 'style transfer' effect",
     )
