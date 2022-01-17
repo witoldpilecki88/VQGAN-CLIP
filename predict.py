@@ -140,7 +140,7 @@ class Predictor(cog.Predictor):
         toksX, toksY = self.args.size[0] // f, self.args.size[1] // f
         sideX, sideY = toksX * f, toksY * f
 
-        if image is not None:
+        if image:
             self.args.init_image = str(image)
             self.args.step_size = 0.25
             if "http" in self.args.init_image:
