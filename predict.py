@@ -4,6 +4,8 @@ clone the following repo if haven't
 - git clone 'https://github.com/CompVis/taming-transformers'
 """
 
+import json
+import requests
 import sys
 import tempfile
 import warnings
@@ -132,7 +134,19 @@ class Predictor(cog.Predictor):
         default=20,
         help="display frequency for intermediate generated images",
     )
-    def predict(self, image, prompts, iterations, display_frequency):
+    @cog.input(
+        "presigned_upload_uri_dicts_str",
+        type=str,
+        default=None,
+        help="list of dicts containing POST parameters fr intermediate iterations"
+    )
+    def predict(self, image, prompts, iterations, display_frequency, presigned_upload_uri_dicts_str):
+
+        if presigned_upload_uri_dicts_str:
+            presigned_upload_uri_dicts = json.loads(presigned_upload_uri_dicts_str)
+        else:
+            presigned_upload_uri_dicts = []
+
         # gumbel is False
         e_dim = self.model.quantize.e_dim
         n_toks = self.model.quantize.n_e
@@ -143,8 +157,11 @@ class Predictor(cog.Predictor):
         if image:
             self.args.init_image = str(image)
             self.args.step_size = 0.25
-            if "http" in self.args.init_image:
-                img = Image.open(urlopen(self.args.init_image))
+            if self.args.init_image.startswith("http"):
+                image_bytes = urlopen(self.args.init_image)
+                if presigned_upload_uri_dicts:
+                    upload_iteration(0, image_bytes, presigned_upload_uri_dicts.pop(0))
+                img = Image.open(image_bytes)
             else:
                 img = Image.open(self.args.init_image)
             pil_image = img.convert("RGB")
@@ -152,6 +169,11 @@ class Predictor(cog.Predictor):
             pil_tensor = TF.to_tensor(pil_image)
             z, *_ = self.model.encode(pil_tensor.to(self.device).unsqueeze(0) * 2 - 1)
         else:
+            if presigned_upload_uri_dicts:
+                img = Image.new("RGB", self.args.size)
+                fname_blank = 'blank.png'
+                img.save(fname_blank)
+                upload_iteration(0, open(fname_blank, 'rb'), presigned_upload_uri_dicts.pop(0))
             one_hot = F.one_hot(
                 torch.randint(n_toks, [toksY * toksX], device=self.device), n_toks
             ).float()
@@ -211,7 +233,11 @@ class Predictor(cog.Predictor):
             )
 
             if i % self.args.display_freq == 0 and not i == self.args.max_iterations:
-                yield checkin(i, lossAll, prompts, self.model, z, out_path)
+                presigned_upload_uri_dict = (
+                    presigned_upload_uri_dicts.pop(0)
+                    if presigned_upload_uri_dicts else None
+                )
+                yield checkin(i, lossAll, prompts, self.model, z, out_path, presigned_upload_uri_dict)
 
             loss = sum(lossAll)
             loss.backward()
@@ -226,14 +252,34 @@ class Predictor(cog.Predictor):
                 yield checkin(i, lossAll, prompts, self.model, z, out_path)
 
 
+def upload_iteration(i, upload_file, presigned_upload_uri_dict):
+    if not presigned_upload_uri_dict:
+        return
+    assert i == presigned_upload_uri_dict['i'], (i, presigned_upload_uri_dict)
+    url = presigned_upload_uri_dict['url']
+    data = presigned_upload_uri_dict['data']
+    files = {'file': upload_file}
+    tqdm.write(f"uploading files: {files}, data: {data}")
+    r = requests.post(url, files=files, data=data)
+    from pprint import pprint
+    pprint(vars(r))
+    tqdm.write(f"done")
+
+
 @torch.inference_mode()
-def checkin(i, losses, prompts, model, z, outpath):
+def checkin(i, losses, prompts, model, z, outpath, presigned_upload_uri_dict=None):
     losses_str = ", ".join(f"{loss.item():g}" for loss in losses)
-    tqdm.write(f"i: {i}, loss: {sum(losses).item():g}, losses: {losses_str}")
+    tqdm.write(
+        f"i: {i}, loss: {sum(losses).item():g}, losses: {losses_str}, "
+        f"outpath: {outpath}"
+    )
     out = synth(z, model)
     info = PngImagePlugin.PngInfo()
     info.add_text("comment", f"{prompts}")
     TF.to_pil_image(out[0].cpu()).save(str(outpath), pnginfo=info)
+
+    upload_iteration(i, open(outpath, "rb"), presigned_upload_uri_dict)
+
     return outpath
 
 
