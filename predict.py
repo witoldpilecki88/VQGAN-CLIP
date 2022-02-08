@@ -4,12 +4,14 @@ clone the following repo if haven't
 - git clone 'https://github.com/CompVis/taming-transformers'
 """
 
+import io
 import json
 import requests
 import sys
 import tempfile
 import warnings
 import numpy as np
+from io import BytesIO
 from pathlib import Path
 from urllib.request import urlopen
 import argparse
@@ -67,6 +69,7 @@ class ClampWithGrad(torch.autograd.Function):
 
 replace_grad = ReplaceGrad.apply
 clamp_with_grad = ClampWithGrad.apply
+init_image_size = []
 
 
 class Predictor(cog.Predictor):
@@ -141,11 +144,19 @@ class Predictor(cog.Predictor):
         help="list of dicts containing POST parameters fr intermediate iterations"
     )
     def predict(self, image, prompts, iterations, display_frequency, presigned_upload_uri_dicts_str):
+        if init_image_size:
+            del init_image_size[0]
 
         if presigned_upload_uri_dicts_str:
             presigned_upload_uri_dicts = json.loads(presigned_upload_uri_dicts_str)
         else:
             presigned_upload_uri_dicts = []
+        print('len(presigned_upload_uri_dicts):', presigned_upload_uri_dicts)
+        presigned_upload_uri_dict_idxs = [
+            presigned['i']
+            for presigned in presigned_upload_uri_dicts
+        ]
+        print('presigned_upload_uri_dict_idxs:', presigned_upload_uri_dict_idxs)
 
         # gumbel is False
         e_dim = self.model.quantize.e_dim
@@ -157,14 +168,17 @@ class Predictor(cog.Predictor):
         if image:
             self.args.init_image = str(image)
             self.args.step_size = 0.25
+            print('self.args.init_image:', self.args.init_image)
             if self.args.init_image.startswith("http"):
                 image_bytes = urlopen(self.args.init_image)
                 if presigned_upload_uri_dicts:
                     upload_iteration(0, image_bytes, presigned_upload_uri_dicts.pop(0))
-                img = Image.open(image_bytes)
+                # TODO: download once and re-use
+                img = Image.open(urlopen(self.args.init_image))
             else:
                 img = Image.open(self.args.init_image)
             pil_image = img.convert("RGB")
+            init_image_size.append(pil_image.size)  # width, height
             pil_image = pil_image.resize((sideX, sideY), Image.LANCZOS)
             pil_tensor = TF.to_tensor(pil_image)
             z, *_ = self.model.encode(pil_tensor.to(self.device).unsqueeze(0) * 2 - 1)
@@ -249,17 +263,31 @@ class Predictor(cog.Predictor):
 
             # Ready to stop yet?
             if i == self.args.max_iterations:
-                yield checkin(i, lossAll, prompts, self.model, z, out_path)
+                presigned_upload_uri_dict = (
+                    presigned_upload_uri_dicts.pop(0)
+                    if presigned_upload_uri_dicts else None
+                )
+                yield checkin(i, lossAll, prompts, self.model, z, out_path, presigned_upload_uri_dict)
 
 
 def upload_iteration(i, upload_file, presigned_upload_uri_dict):
     if not presigned_upload_uri_dict:
         return
     assert i == presigned_upload_uri_dict['i'], (i, presigned_upload_uri_dict)
+    if init_image_size:
+        # resize to init_image_size
+        tqdm.write(f"resizing to {init_image_size=}")
+        image = Image.open(upload_file)
+        image = image.resize(init_image_size[0])
+        image_buffer = BytesIO()
+        image.save(image_buffer, 'PNG')
+        image_buffer.seek(0)
+        upload_file = image_buffer.getvalue()
+
     url = presigned_upload_uri_dict['url']
     data = presigned_upload_uri_dict['data']
     files = {'file': upload_file}
-    tqdm.write(f"uploading files: {files}, data: {data}")
+    tqdm.write(f"uploading files, data: {data}")
     r = requests.post(url, files=files, data=data)
     from pprint import pprint
     pprint(vars(r))
@@ -271,7 +299,7 @@ def checkin(i, losses, prompts, model, z, outpath, presigned_upload_uri_dict=Non
     losses_str = ", ".join(f"{loss.item():g}" for loss in losses)
     tqdm.write(
         f"i: {i}, loss: {sum(losses).item():g}, losses: {losses_str}, "
-        f"outpath: {outpath}"
+        f"outpath: {outpath}, presigned_upload_uri_dict: {presigned_upload_uri_dict}"
     )
     out = synth(z, model)
     info = PngImagePlugin.PngInfo()
